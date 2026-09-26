@@ -9,8 +9,14 @@
     importJSON,
     pack,
     packResult,
-    saveNow
+    saveNow,
+    undoLastMerge,
+    canUndoMerge,
+    lastMerge
   } from "../core/store";
+  import MergeDialog from "./MergeDialog.svelte";
+
+  let mergeOpen = false;
 
   let pngInput: HTMLInputElement;
   let jsonInput: HTMLInputElement;
@@ -56,6 +62,7 @@
   <button on:click={() => jsonInput.click()} title="选择导出的 atlas.json（可连同 atlas.png 一起选）">
     导入 JSON 恢复
   </button>
+  <button id="open-merge-btn" on:click={() => (mergeOpen = true)}>合并工程…</button>
 
   <span class="sep"></span>
 
@@ -67,11 +74,25 @@
 
   <span class="sep"></span>
 
+  <button id="undo-merge-btn" disabled={!$canUndoMerge || $busy} on:click={() => void undoLastMerge()} title="撤销最近一次工程合并">
+    撤销合并
+  </button>
   <button on:click={() => void saveNow()} title="保存到 IndexedDB">保存项目</button>
   <button class="danger" on:click={() => void clearStorage()}>清空</button>
 
   <span class="count mono">{$frameCount} 帧</span>
 </div>
+
+{#if $lastMerge}
+  <div class="merge-summary mono" id="merge-summary" title={JSON.stringify($lastMerge.decisions, null, 2)}>
+    合并 {$lastMerge.finalFrameCount} 资源 / {$lastMerge.finalSequenceLength} 引用 ·
+    同内容 {$lastMerge.identicalCount} · 冲突 {$lastMerge.conflictCount} ·
+    来源 {$lastMerge.currentSourceHash.slice(0, 6)} + {$lastMerge.importedSourceHash.slice(0, 6)}
+    {$lastMerge.undoable === false ? "· 再导入后不可撤销" : ""}
+  </div>
+{/if}
+
+<MergeDialog open={mergeOpen} close={() => (mergeOpen = false)} />
 
 <style>
   .toolbar {
@@ -89,5 +110,10 @@
   .count {
     margin-left: auto;
     color: var(--text-dim);
+  }
+  .merge-summary {
+    padding: 0 16px 8px;
+    color: var(--text-dim);
+    font-size: 12px;
   }
 </style>

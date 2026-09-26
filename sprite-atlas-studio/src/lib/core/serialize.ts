@@ -1,5 +1,6 @@
 import type { PackLayout } from "./pack";
 import type { Settings } from "./types";
+import type { MergeSummary } from "./merge";
 
 /**
  * 图集 JSON 格式：兼容 TexturePacker "Hash" 结构，
@@ -41,6 +42,13 @@ export interface AtlasJSON {
     totalDuration: number;
     /** 内嵌图集（data:image/png;base64,...），存在时可独立恢复 */
     atlasDataURL?: string;
+    /**
+     * 播放顺序中的逐次引用。名称可重复，表示同一帧资源在序列中出现多次；
+     * frames 仍按名称保留 TexturePacker 兼容视图。
+     */
+    frameEntries?: Array<AtlasJSONFrame & { id: string; name: string }>;
+    /** 最近一次合并的来源与冲突决策；导出/再导入后用于核对一致性 */
+    mergeSummary?: MergeSummary;
   };
 }
 
@@ -49,6 +57,7 @@ export interface BuildJsonOptions {
   trimmed: boolean;
   settings: Settings;
   atlasDataURL?: string;
+  mergeSummary?: MergeSummary;
 }
 
 /** 由打包结果生成 JSON 对象（纯函数） */
@@ -57,8 +66,10 @@ export function buildAtlasJSON(layout: PackLayout, opts: BuildJsonOptions): Atla
   const frameOrder: string[] = [];
   let total = 0;
 
+  const frameEntries: NonNullable<AtlasJSON["meta"]["frameEntries"]> = [];
+
   for (const f of layout.frames) {
-    frames[f.name] = {
+    const entry: AtlasJSONFrame = {
       frame: { x: f.x, y: f.y, w: f.w, h: f.h },
       rotated: false,
       trimmed: opts.trimmed,
@@ -66,7 +77,9 @@ export function buildAtlasJSON(layout: PackLayout, opts: BuildJsonOptions): Atla
       sourceSize: { w: f.srcW, h: f.srcH },
       duration: f.duration
     };
+    frames[f.name] = entry;
     frameOrder.push(f.name);
+    frameEntries.push({ ...entry, id: f.id, name: f.name });
     total += Math.max(1, f.duration);
   }
 
@@ -84,14 +97,17 @@ export function buildAtlasJSON(layout: PackLayout, opts: BuildJsonOptions): Atla
       maxSize: opts.settings.maxSize,
       pot: opts.settings.pot
     },
-    totalDuration: total
+    totalDuration: total,
+    frameEntries
   };
   if (opts.atlasDataURL) meta.atlasDataURL = opts.atlasDataURL;
+  if (opts.mergeSummary) meta.mergeSummary = opts.mergeSummary;
 
   return { frames, meta };
 }
 
 export interface ParsedFrameEntry {
+  id?: string;
   name: string;
   duration: number;
   frame: { x: number; y: number; w: number; h: number };
@@ -107,6 +123,7 @@ export interface ParsedAtlasJSON {
   settings: Settings;
   imageName: string;
   atlasDataURL?: string;
+  mergeSummary?: MergeSummary;
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -132,6 +149,7 @@ export function parseAtlasJSON(raw: unknown): ParsedAtlasJSON {
   if (!isRecord(raw)) throw new Error("JSON 格式错误：顶层应为对象");
   if (!isRecord(raw.meta)) throw new Error("JSON 格式错误：缺少 meta");
   if (!isRecord(raw.frames)) throw new Error("JSON 格式错误：缺少 frames");
+  const framesRecord = raw.frames;
 
   const meta = raw.meta;
   if (meta.app !== JSON_APP_ID) {
@@ -151,15 +169,14 @@ export function parseAtlasJSON(raw: unknown): ParsedAtlasJSON {
 
   const order: string[] = Array.isArray(meta.frameOrder)
     ? meta.frameOrder.filter((n): n is string => typeof n === "string")
-    : Object.keys(raw.frames);
+    : Object.keys(framesRecord);
 
-  const frames: ParsedFrameEntry[] = [];
-  for (const name of order) {
-    const f = raw.frames[name];
+  function parseEntry(f: unknown, name: string, id: string | undefined, index: number): ParsedFrameEntry {
     if (!isRecord(f)) throw new Error(`JSON 格式错误：帧 "${name}" 缺少数据`);
-    const fr = rect(f.frame, `frames.${name}.frame`, ["x", "y", "w", "h"]);
-    const ss = rect(f.spriteSourceSize, `frames.${name}.spriteSourceSize`, ["x", "y", "w", "h"]);
-    const src = rect(f.sourceSize, `frames.${name}.sourceSize`, ["w", "h"]);
+    const label = `frames.${name}#${index}`;
+    const fr = rect(f.frame, `${label}.frame`, ["x", "y", "w", "h"]);
+    const ss = rect(f.spriteSourceSize, `${label}.spriteSourceSize`, ["x", "y", "w", "h"]);
+    const src = rect(f.sourceSize, `${label}.sourceSize`, ["w", "h"]);
     const frame = { x: fr.x!, y: fr.y!, w: fr.w!, h: fr.h! };
     const spriteSourceSize = { x: ss.x!, y: ss.y!, w: ss.w!, h: ss.h! };
     const sourceSize = { w: src.w!, h: src.h! };
@@ -173,20 +190,60 @@ export function parseAtlasJSON(raw: unknown): ParsedAtlasJSON {
       throw new Error(`JSON 格式错误：帧 "${name}" 的裁切区域超出原始尺寸`);
     }
 
-    frames.push({
+    return {
+      ...(typeof id === "string" ? { id } : {}),
       name,
       duration: typeof f.duration === "number" && f.duration > 0 ? f.duration : 100,
       frame,
       spriteSourceSize,
       sourceSize,
       trimmed: f.trimmed === true
-    });
+    };
   }
+
+  const rawEntries = Array.isArray(meta.frameEntries) ? meta.frameEntries : null;
+  const entryNameCount = new Map<string, number>();
+  if (rawEntries) {
+    for (const f of rawEntries) {
+      if (isRecord(f) && typeof f.name === "string") entryNameCount.set(f.name, (entryNameCount.get(f.name) ?? 0) + 1);
+    }
+  }
+  const legacyByName = new Map(
+    order.map((name, i) => [name, parseEntry(framesRecord[name], name, undefined, i)] as const)
+  );
+  const frames: ParsedFrameEntry[] = rawEntries
+    ? rawEntries.map((f, i) => {
+        if (!isRecord(f) || typeof f.name !== "string") {
+          throw new Error(`JSON 格式错误：meta.frameEntries[${i}] 缺少名称`);
+        }
+        const entry = parseEntry(f, f.name, typeof f.id === "string" ? f.id : undefined, i);
+        const legacy = legacyByName.get(entry.name);
+        if (!legacy) throw new Error(`JSON 格式错误：帧 "${entry.name}" 在 frames 表中不存在`);
+        const compareRects = (a: ParsedFrameEntry, b: ParsedFrameEntry): boolean => {
+          const groups: Array<"frame" | "spriteSourceSize" | "sourceSize"> = ["frame", "spriteSourceSize", "sourceSize"];
+          const keys = ["x", "y", "w", "h"] as const;
+          return groups.every((group) =>
+            keys.every((key) => (a[group] as Record<string, number | undefined>)[key] === (b[group] as Record<string, number | undefined>)[key])
+          );
+        };
+        if ((entryNameCount.get(entry.name) ?? 0) <= 1 && !compareRects(entry, legacy)) {
+          throw new Error(`JSON 格式错误：帧 "${entry.name}" 的 frameEntries 与 frames 表不一致`);
+        }
+        if (entry.trimmed !== legacy.trimmed) {
+          throw new Error(`JSON 格式错误：帧 "${entry.name}" 的逐次引用与 frames 表不一致`);
+        }
+        // frameEntries 是播放顺序的权威数据；同名重复引用允许有各自时长。
+        return entry;
+      })
+    : order.map((name, i) => parseEntry(framesRecord[name], name, undefined, i));
 
   if (frames.length === 0) throw new Error("JSON 中没有任何帧");
 
   const imageName = typeof meta.image === "string" ? meta.image : "atlas.png";
   const atlasDataURL = typeof meta.atlasDataURL === "string" ? meta.atlasDataURL : undefined;
+  const mergeSummary = isRecord(meta.mergeSummary)
+    ? (meta.mergeSummary as unknown as MergeSummary)
+    : undefined;
 
-  return { frames, size, settings, imageName, ...(atlasDataURL ? { atlasDataURL } : {}) };
+  return { frames, size, settings, imageName, ...(atlasDataURL ? { atlasDataURL } : {}), ...(mergeSummary ? { mergeSummary } : {}) };
 }

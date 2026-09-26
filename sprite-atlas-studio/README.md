@@ -13,7 +13,8 @@
 - **图集视图**：编号框标注每帧位置，表格列出 x/y/w/h、裁切偏移、原始尺寸、时长
 - **导出**：`atlas.png` + `atlas.json`（TexturePacker Hash 兼容结构，扩展 `duration` / `frameOrder` / `settings`；可内嵌图集 dataURL）
 - **导入 JSON 恢复**：从导出的 JSON 完整恢复帧列表、顺序、时长与打包结果（图集内嵌时无需另选图片；否则连同 `atlas.png` 一起选择）
-- **IndexedDB 持久化**：帧 PNG（Blob）、设置与打包结果自动保存到浏览器本地，刷新后恢复
+- **两个本地工程合并**：选择当前工程与另一个内嵌图集的工程 JSON，先按解码后 RGBA 内容摘要识别同内容帧；支持同名冲突逐项选择保留当前、采用导入、重命名导入，批量规则后仍可单项覆盖；自动合并播放顺序/图集引用，确认时原子写入 IndexedDB 并重新打包，失败完整回滚；最近一次合并可刷新后撤销，导出的 JSON 携带来源摘要和冲突决策
+- **IndexedDB 持久化**：帧 PNG（Blob）、设置、打包结果和合并撤销快照自动保存到浏览器本地，不上传任何数据。，刷新后恢复
 
 ## 技术栈
 
@@ -34,7 +35,7 @@ npm run check      # svelte-check 类型检查
 ```bash
 npm run gen-assets # 生成验证素材到 test-assets/（8 帧：不同尺寸 + 不等厚透明边缘）
 npm test           # vitest：单元（裁切/打包/计时/序列化）+ 集成（真实 PNG 全管线）
-npm run e2e        # Playwright：浏览器全流程（导入→打包→预览→导出→导入 JSON 恢复→刷新恢复）
+npm run e2e        # Playwright：浏览器全流程（基础管线 + 工程合并原子性/撤销/再导入一致性）
 ```
 
 集成测试（`tests/integration/pipeline.test.ts`）用真实 PNG 验证：
@@ -63,7 +64,16 @@ npm run e2e        # Playwright：浏览器全流程（导入→打包→预览�
     "version": "1.0.0",
     "image": "atlas.png",
     "size": { "w": 256, "h": 512 },
-    "frameOrder": ["walk_01.png", "..."],   // 原始播放顺序
+    "frameOrder": ["walk_01.png", "walk_01.png", "..."], // 播放顺序；名称可重复表示多处引用
+    "frameEntries": [
+      { "id": "f...", "name": "walk_01.png", "...": "逐次引用（含同名重复帧各自的图集位置/时长）" }
+    ],
+    "mergeSummary": {
+      "id": "merge_...",
+      "currentSourceHash": "...",
+      "importedSourceHash": "...",
+      "decisions": [{ "name": "walk_02.png", "decision": "keep-current", "newName": "walk_02_imported.png" }]
+    },
     "settings": { "trim": true, "padding": 2, "maxSize": 2048, "pot": true },
     "totalDuration": 950,
     "atlasDataURL": "data:image/png;base64,..."  // 可选：内嵌图集，JSON 可独立恢复

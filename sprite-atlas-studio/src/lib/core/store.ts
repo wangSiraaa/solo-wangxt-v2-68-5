@@ -15,7 +15,27 @@ import {
   makeCanvas,
   uid
 } from "./image";
-import { clearProject, loadProject, saveProject, toStored } from "./db";
+import {
+  clearProject,
+  commitMergedProject,
+  commitUndo,
+  loadLastMerge,
+  loadProject,
+  loadUndoRecord,
+  replaceProjectAndClearMerge,
+  saveProject,
+  toStored,
+  type StoredProject
+} from "./db";
+import {
+  buildMergePlan,
+  createMergePreview,
+  loadImportedProject,
+  projectFromFrames,
+  type MergePlan,
+  type MergePreview,
+  type MergeSummary
+} from "./merge";
 
 export const frames = writable<FrameItem[]>([]);
 export const settings = writable<Settings>({ ...DEFAULT_SETTINGS });
@@ -23,6 +43,8 @@ export const packResult = writable<PackResult | null>(null);
 export const selectedId = writable<string | null>(null);
 export const busy = writable(false);
 export const status = writable<{ kind: "info" | "error"; text: string } | null>(null);
+export const lastMerge = writable<MergeSummary | null>(null);
+export const canUndoMerge = writable(false);
 
 export const frameCount = derived(frames, ($f) => $f.length);
 
@@ -83,6 +105,7 @@ export async function addFiles(files: Iterable<File>): Promise<void> {
     if (added.length > 0) {
       frames.set([...current, ...added]);
       packResult.set(null); // 帧变化后旧的打包结果失效
+      lastJSON = null;
       notify(`已导入 ${added.length} 帧`);
     }
   } finally {
@@ -97,6 +120,7 @@ export function removeFrame(id: string): void {
   URL.revokeObjectURL(f.url);
   frames.set(list.filter((x) => x.id !== id));
   packResult.set(null);
+  lastJSON = null;
 }
 
 export function moveFrame(id: string, dir: -1 | 1): void {
@@ -109,6 +133,7 @@ export function moveFrame(id: string, dir: -1 | 1): void {
   list[j] = a;
   frames.set(list);
   packResult.set(null);
+  lastJSON = null;
 }
 
 export function setDuration(id: string, ms: number): void {
@@ -122,14 +147,19 @@ export function setAllDurations(ms: number): void {
   frames.set(get(frames).map((f) => ({ ...f, duration: v })));
 }
 
-export function clearAll(): void {
-  for (const f of get(frames)) URL.revokeObjectURL(f.url);
-  const pack = get(packResult);
+function revokeRuntime(list: FrameItem[], pack: PackResult | null): void {
+  for (const f of list) URL.revokeObjectURL(f.url);
   if (pack) URL.revokeObjectURL(pack.atlasUrl);
+}
+
+export function clearAll(): void {
+  revokeRuntime(get(frames), get(packResult));
   frames.set([]);
   packResult.set(null);
   selectedId.set(null);
   lastJSON = null;
+  lastMerge.set(null);
+  canUndoMerge.set(false);
 }
 
 // ---------- 打包 ----------
@@ -160,6 +190,82 @@ async function trimFrame(item: FrameItem, doTrim: boolean): Promise<TrimmedFrame
   return { item, canvas, trim: bbox };
 }
 
+interface BuiltPack {
+  result: PackResult;
+  json: AtlasJSON;
+}
+
+/** 根据帧列表重新打包；任何图片无法解码或打包失败都会抛错。 */
+async function buildPackedState(
+  list: FrameItem[],
+  s: Settings,
+  mergeSummary?: MergeSummary
+): Promise<BuiltPack> {
+  if (list.length === 0) throw new Error("请先导入 PNG 帧");
+
+  const trimmed: TrimmedFrame[] = [];
+  for (const item of list) trimmed.push(await trimFrame(item, s.trim));
+
+  const inputs: PackInput[] = trimmed.map((t) => ({
+    id: t.item.id,
+    name: t.item.name,
+    w: t.canvas.width,
+    h: t.canvas.height,
+    trim: t.trim,
+    srcW: t.item.width,
+    srcH: t.item.height,
+    duration: t.item.duration
+  }));
+
+  const layout: PackLayout = packFrames(inputs, s.padding, s.maxSize, s.pot);
+
+  // 合成图集画布
+  const atlas = makeCanvas(layout.atlasWidth, layout.atlasHeight);
+  const ctx = ctx2d(atlas);
+  const canvasById = new Map(trimmed.map((t) => [t.item.id, t.canvas]));
+  for (const f of layout.frames) {
+    const c = canvasById.get(f.id);
+    if (!c) throw new Error(`打包失败：缺少帧 ${f.name}`);
+    ctx.drawImage(c, f.x, f.y);
+  }
+
+  const atlasBlob = await canvasToBlob(atlas);
+  const result: PackResult = {
+    atlasWidth: layout.atlasWidth,
+    atlasHeight: layout.atlasHeight,
+    frames: layout.frames,
+    atlasBlob,
+    atlasUrl: URL.createObjectURL(atlasBlob),
+    padding: s.padding,
+    trimmed: s.trim
+  };
+  const json = buildAtlasJSON(layout, {
+    imageName: "atlas.png",
+    trimmed: s.trim,
+    settings: s,
+    ...(mergeSummary ? { mergeSummary } : {})
+  });
+  return { result, json };
+}
+
+function replaceRuntime(next: {
+  frames: FrameItem[];
+  settings: Settings;
+  pack: PackResult | null;
+  json: AtlasJSON | null;
+  merge: MergeSummary | null;
+  undoable: boolean;
+}): void {
+  revokeRuntime(get(frames), get(packResult));
+  frames.set(next.frames);
+  settings.set(next.settings);
+  packResult.set(next.pack);
+  lastJSON = next.json;
+  selectedId.set(next.frames[0]?.id ?? null);
+  lastMerge.set(next.merge);
+  canUndoMerge.set(next.undoable);
+}
+
 /** 执行打包并生成图集 */
 export async function pack(): Promise<void> {
   const list = get(frames);
@@ -169,55 +275,23 @@ export async function pack(): Promise<void> {
   }
   const s = get(settings);
   busy.set(true);
+  let suppressAuto = true;
   try {
-    const trimmed: TrimmedFrame[] = [];
-    for (const item of list) trimmed.push(await trimFrame(item, s.trim));
-
-    const inputs: PackInput[] = trimmed.map((t) => ({
-      id: t.item.id,
-      name: t.item.name,
-      w: t.canvas.width,
-      h: t.canvas.height,
-      trim: t.trim,
-      srcW: t.item.width,
-      srcH: t.item.height,
-      duration: t.item.duration
-    }));
-
-    const layout: PackLayout = packFrames(inputs, s.padding, s.maxSize, s.pot);
-
-    // 合成图集画布
-    const atlas = makeCanvas(layout.atlasWidth, layout.atlasHeight);
-    const ctx = ctx2d(atlas);
-    const canvasById = new Map(trimmed.map((t) => [t.item.id, t.canvas]));
-    for (const f of layout.frames) {
-      const c = canvasById.get(f.id);
-      if (c) ctx.drawImage(c, f.x, f.y);
-    }
-
+    const mergeSummaryForExport = get(lastMerge)
+      ? { ...get(lastMerge)!, undoable: false }
+      : undefined;
+    const built = await buildPackedState(list, s, mergeSummaryForExport);
     const old = get(packResult);
     if (old) URL.revokeObjectURL(old.atlasUrl);
-    const atlasBlob = await canvasToBlob(atlas);
-    const result: PackResult = {
-      atlasWidth: layout.atlasWidth,
-      atlasHeight: layout.atlasHeight,
-      frames: layout.frames,
-      atlasBlob,
-      atlasUrl: URL.createObjectURL(atlasBlob),
-      padding: s.padding,
-      trimmed: s.trim
-    };
-    packResult.set(result);
-    lastJSON = buildAtlasJSON(layout, {
-      imageName: "atlas.png",
-      trimmed: s.trim,
-      settings: s
-    });
-    notify(`打包完成：${layout.atlasWidth}×${layout.atlasHeight}，共 ${layout.frames.length} 帧`);
+    packResult.set(built.result);
+    lastJSON = built.json;
+    suppressAuto = false;
+    notify(`打包完成：${built.result.atlasWidth}×${built.result.atlasHeight}，共 ${built.result.frames.length} 帧`);
   } catch (e) {
     notify(e instanceof Error ? e.message : String(e), "error");
   } finally {
     busy.set(false);
+    if (suppressAuto) scheduleSave();
   }
 }
 
@@ -255,7 +329,184 @@ async function blobToCanvas(blob: Blob): Promise<HTMLCanvasElement> {
   return c;
 }
 
+// ---------- 工程合并 ----------
+
+export async function prepareImportedMergeProject(file: File) {
+  return await loadImportedProject(file);
+}
+
+export async function createPreviewFromCurrent(imported: Awaited<ReturnType<typeof prepareImportedMergeProject>>) {
+  const current = get(frames).map((f) => ({
+    name: f.name,
+    duration: f.duration,
+    width: f.width,
+    height: f.height,
+    blob: f.blob,
+    url: f.url
+  }));
+  return await createMergePreview(current, get(settings), imported);
+}
+
+/**
+ * 确认合并：
+ * 1. 先在内存中生成所有帧、验证引用并重新打包；
+ * 2. 再用一个 IndexedDB readwrite 事务同时写项目和撤销快照；
+ * 3. 任一步失败都不触碰当前运行时和已提交的数据库状态。
+ */
+export async function confirmMerge(
+  preview: MergePreview,
+  decisions: MergeSummary["decisions"]
+): Promise<MergeSummary> {
+  busy.set(true);
+  let newFrames: FrameItem[] = [];
+  let built: BuiltPack | null = null;
+  try {
+    const plan: MergePlan = buildMergePlan(preview, decisions);
+    const byName = new Map(plan.assets.map((a) => [a.name, a]));
+    newFrames = plan.order.map((ref) => {
+      const asset = byName.get(ref.name);
+      if (!asset) throw new Error(`悬空引用：${ref.name}`);
+      return {
+        id: uid(),
+        name: asset.name,
+        duration: ref.duration,
+        width: asset.width,
+        height: asset.height,
+        blob: asset.blob,
+        url: URL.createObjectURL(asset.blob)
+      };
+    });
+
+    // 立即解码所有新帧：损坏图片在事务开始前失败。
+    await Promise.all(newFrames.map((f) => blobToImage(f.blob)));
+    built = await buildPackedState(newFrames, plan.settings);
+
+    const now = Date.now();
+    const summary: MergeSummary = {
+      id: `merge_${now.toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+      createdAt: new Date(now).toISOString(),
+      ...plan.summary
+    };
+    built.json = buildAtlasJSON(
+      {
+        atlasWidth: built.result.atlasWidth,
+        atlasHeight: built.result.atlasHeight,
+        frames: built.result.frames
+      },
+      {
+        imageName: "atlas.png",
+        trimmed: plan.settings.trim,
+        settings: plan.settings,
+        mergeSummary: summary
+      }
+    );
+
+    const before = toStored(get(frames), get(settings), get(packResult), lastJSON);
+    const mergedProject = toStored(newFrames, plan.settings, built.result, built.json);
+
+    try {
+      await commitMergedProject(mergedProject, {
+        mergeId: summary.id,
+        summary,
+        before,
+        createdAt: now
+      });
+    } catch (e) {
+      throw new Error(`合并事务已回滚：${e instanceof Error ? e.message : String(e)}`);
+    }
+
+    replaceRuntime({
+      frames: newFrames,
+      settings: { ...plan.settings },
+      pack: built.result,
+      json: built.json,
+      merge: summary,
+      undoable: true
+    });
+    built = null; // 运行时已接管 URL
+    notify("合并完成：IndexedDB 已原子更新，可撤销本次合并");
+    return summary;
+  } catch (e) {
+    for (const f of newFrames) URL.revokeObjectURL(f.url);
+    if (built) URL.revokeObjectURL(built.result.atlasUrl);
+    notify(e instanceof Error ? e.message : String(e), "error");
+    throw e;
+  } finally {
+    busy.set(false);
+  }
+}
+
+export async function undoLastMerge(): Promise<void> {
+  busy.set(true);
+  try {
+    const undo = await loadUndoRecord();
+    if (!undo) throw new Error("没有可撤销的合并记录");
+    const restored = await frameItemsFromStored(undo.before);
+    try {
+      await commitUndo(undo.before);
+    } catch (e) {
+      revokeRuntime(restored.frames, restored.pack);
+      throw new Error(`撤销事务已回滚：${e instanceof Error ? e.message : String(e)}`);
+    }
+    replaceRuntime({ ...restored, merge: null, undoable: false });
+    notify("已撤销最近一次合并，并恢复到合并前项目");
+  } catch (e) {
+    notify(e instanceof Error ? e.message : String(e), "error");
+  } finally {
+    busy.set(false);
+  }
+}
+
 // ---------- 导入 JSON 恢复 ----------
+
+interface RuntimeProject {
+  frames: FrameItem[];
+  settings: Settings;
+  pack: PackResult | null;
+  json: AtlasJSON | null;
+}
+
+async function frameItemsFromStored(stored: StoredProject): Promise<RuntimeProject> {
+  const restoredFrames: FrameItem[] = stored.frames.map((f) => ({
+    id: f.id,
+    name: f.name,
+    duration: f.duration,
+    width: f.width,
+    height: f.height,
+    blob: f.blob,
+    url: URL.createObjectURL(f.blob)
+  }));
+
+  let pack: PackResult | null = null;
+  let json: AtlasJSON | null = null;
+  if (stored.pack) {
+    const parsed = parseAtlasJSON(stored.pack.json);
+    const packedFrames: PackedFrame[] = parsed.frames.map((f) => ({
+      id: f.id ?? restoredFrames.find((r) => r.name === f.name)?.id ?? uid(),
+      name: f.name,
+      x: f.frame.x,
+      y: f.frame.y,
+      w: f.frame.w,
+      h: f.frame.h,
+      trim: { ...f.spriteSourceSize },
+      srcW: f.sourceSize.w,
+      srcH: f.sourceSize.h,
+      duration: f.duration
+    }));
+    pack = {
+      atlasWidth: parsed.size.w,
+      atlasHeight: parsed.size.h,
+      frames: packedFrames,
+      atlasBlob: stored.pack.atlasBlob,
+      atlasUrl: URL.createObjectURL(stored.pack.atlasBlob),
+      padding: parsed.settings.padding,
+      trimmed: parsed.settings.trim
+    };
+    json = stored.pack.json;
+  }
+
+  return { frames: restoredFrames, settings: { ...DEFAULT_SETTINGS, ...stored.settings }, pack, json };
+}
 
 /**
  * 从导出的 JSON 恢复帧列表、时长与打包结果。
@@ -263,6 +514,7 @@ async function blobToCanvas(blob: Blob): Promise<HTMLCanvasElement> {
  */
 export async function importJSON(jsonFile: File, atlasFile?: File): Promise<void> {
   busy.set(true);
+  let candidate: (RuntimeProject & { merge: MergeSummary | null }) | null = null;
   try {
     const raw: unknown = JSON.parse(await jsonFile.text());
     const parsed = parseAtlasJSON(raw);
@@ -300,7 +552,7 @@ export async function importJSON(jsonFile: File, atlasFile?: File): Promise<void
         f.frame.h
       );
       const blob = await canvasToBlob(full);
-      const id = uid();
+      const id = f.id ?? uid();
       restored.push({
         id,
         name: f.name,
@@ -324,10 +576,10 @@ export async function importJSON(jsonFile: File, atlasFile?: File): Promise<void
       });
     }
 
-    clearAll();
-    frames.set(restored);
-    settings.set({ ...parsed.settings });
-    packResult.set({
+    // 强制再解码一次切出的帧；损坏内容在替换当前工程前失败。
+    await Promise.all(restored.map((f) => blobToImage(f.blob)));
+
+    const result: PackResult = {
       atlasWidth: parsed.size.w,
       atlasHeight: parsed.size.h,
       frames: packedFrames,
@@ -335,13 +587,27 @@ export async function importJSON(jsonFile: File, atlasFile?: File): Promise<void
       atlasUrl: URL.createObjectURL(atlasBlob),
       padding: parsed.settings.padding,
       trimmed: parsed.settings.trim
-    });
-    lastJSON = buildAtlasJSON(
+    };
+    const merge = parsed.mergeSummary ? { ...parsed.mergeSummary, undoable: false } : null;
+    const json = buildAtlasJSON(
       { atlasWidth: parsed.size.w, atlasHeight: parsed.size.h, frames: packedFrames },
-      { imageName: parsed.imageName, trimmed: parsed.settings.trim, settings: parsed.settings }
+      {
+        imageName: parsed.imageName,
+        trimmed: parsed.settings.trim,
+        settings: parsed.settings,
+        ...(merge ? { mergeSummary: merge } : {})
+      }
     );
-    notify(`已从 JSON 恢复 ${restored.length} 帧与打包结果`);
+    candidate = { frames: restored, settings: { ...parsed.settings }, pack: result, json, merge };
+
+    // 数据库原子替换成功后才切换页面状态；失败时当前工程保持不变。
+    await replaceProjectAndClearMerge(toStored(restored, parsed.settings, result, json));
+    const committed = candidate;
+    candidate = null;
+    if (committed) replaceRuntime({ ...committed, undoable: false});
+    notify(`已从 JSON 恢复 ${restored.length} 个序列引用与打包结果`);
   } catch (e) {
+    if (candidate) revokeRuntime(candidate.frames, candidate.pack);
     notify(e instanceof Error ? e.message : String(e), "error");
   } finally {
     busy.set(false);
@@ -362,43 +628,24 @@ export async function saveNow(): Promise<void> {
 export async function restoreFromDB(): Promise<boolean> {
   try {
     const stored = await loadProject();
-    if (!stored || stored.frames.length === 0) return false;
-    const restored: FrameItem[] = stored.frames.map((f) => ({
-      id: f.id,
-      name: f.name,
-      duration: f.duration,
-      width: f.width,
-      height: f.height,
-      blob: f.blob,
-      url: URL.createObjectURL(f.blob)
-    }));
-    frames.set(restored);
-    settings.set({ ...DEFAULT_SETTINGS, ...stored.settings });
-    if (stored.pack) {
-      const parsed = parseAtlasJSON(stored.pack.json);
-      const packedFrames: PackedFrame[] = parsed.frames.map((f, i) => ({
-        id: restored[i]?.id ?? uid(),
-        name: f.name,
-        x: f.frame.x,
-        y: f.frame.y,
-        w: f.frame.w,
-        h: f.frame.h,
-        trim: { ...f.spriteSourceSize },
-        srcW: f.sourceSize.w,
-        srcH: f.sourceSize.h,
-        duration: f.duration
-      }));
-      packResult.set({
-        atlasWidth: parsed.size.w,
-        atlasHeight: parsed.size.h,
-        frames: packedFrames,
-        atlasBlob: stored.pack.atlasBlob,
-        atlasUrl: URL.createObjectURL(stored.pack.atlasBlob),
-        padding: parsed.settings.padding,
-        trimmed: parsed.settings.trim
-      });
-      lastJSON = stored.pack.json;
+    if (!stored || stored.frames.length === 0) {
+      const mergeInfo = await loadLastMerge();
+      if (mergeInfo) {
+        lastMerge.set({ ...mergeInfo.summary, undoable: false });
+        canUndoMerge.set(false);
+      }
+      return false;
     }
+    const restored = await frameItemsFromStored(stored);
+    const undo = await loadUndoRecord();
+    const mergeInfo = undo
+      ? { summary: undo.summary, undoable: true }
+      : await loadLastMerge().then((m) => (m ? { summary: { ...m.summary, undoable: false }, undoable: false } : null));
+    replaceRuntime({
+      ...restored,
+      merge: mergeInfo?.summary ?? null,
+      undoable: Boolean(mergeInfo?.undoable)
+    });
     return true;
   } catch {
     return false;
@@ -411,7 +658,7 @@ export async function clearStorage(): Promise<void> {
   notify("已清空本地项目");
 }
 
-// 自动保存（防抖）
+// 自动保存（防抖）。合并/撤销自行使用事务提交，禁止旧状态定时器覆盖原子结果。
 let saveTimer: ReturnType<typeof setTimeout> | undefined;
 function scheduleSave(): void {
   clearTimeout(saveTimer);
