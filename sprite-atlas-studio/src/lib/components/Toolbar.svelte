@@ -53,8 +53,8 @@
   />
 
   <button class="primary" on:click={() => pngInput.click()}>导入 PNG 帧</button>
-  <button on:click={() => jsonInput.click()} title="选择导出的 atlas.json（可连同 atlas.png 一起选）">
-    导入 JSON 恢复
+  <button on:click={() => jsonInput.click()} title="选择导出的 atlas.json（可连同 atlas.png 一起选），作为新工程导入">
+    导入 JSON 工程
   </button>
 
   <span class="sep"></span>

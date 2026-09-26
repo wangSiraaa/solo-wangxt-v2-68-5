@@ -8,10 +8,20 @@ export interface FrameItem {
   width: number;
   /** 原始高度 */
   height: number;
+  /** 像素级内容摘要（SHA-256），合并时据此识别相同帧 */
+  hash: string;
   /** 原始 PNG 数据（不离开浏览器） */
   blob: Blob;
   /** 预览用 object URL */
   url: string;
+}
+
+/** 动画片段：一组有序的帧引用（顺序引用），帧可属于多个片段 */
+export interface Clip {
+  id: string;
+  name: string;
+  /** 有序帧引用（FrameItem.id） */
+  frameIds: string[];
 }
 
 /** 透明边缘裁切结果（相对原始图的偏移与内容尺寸） */

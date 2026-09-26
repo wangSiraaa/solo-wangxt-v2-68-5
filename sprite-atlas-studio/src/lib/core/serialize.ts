@@ -20,6 +20,23 @@ export interface AtlasJSONFrame {
   duration: number;
 }
 
+/** 导出到 JSON 的合并历史记录（仅摘要与决策，不含回滚快照） */
+export interface ExportedMergeRecord {
+  id: string;
+  ts: number;
+  undone: boolean;
+  source: { name: string; origin: string; frameCount: number; clipCount: number };
+  decisions: Record<string, string>;
+  renames: Record<string, string>;
+  summary: { identical: number; conflicts: number; added: number; clipsAdded: number; clipsRenamed: number };
+}
+
+export interface AtlasJSONClip {
+  name: string;
+  /** 按顺序引用的帧名 */
+  frames: string[];
+}
+
 export interface AtlasJSON {
   frames: Record<string, AtlasJSONFrame>;
   meta: {
@@ -41,6 +58,12 @@ export interface AtlasJSON {
     totalDuration: number;
     /** 内嵌图集（data:image/png;base64,...），存在时可独立恢复 */
     atlasDataURL?: string;
+    /** 工程名（导入时作为新工程名） */
+    projectName?: string;
+    /** 动画片段（按帧名顺序引用） */
+    clips?: AtlasJSONClip[];
+    /** 合并历史（来源摘要与冲突决策） */
+    mergeHistory?: ExportedMergeRecord[];
   };
 }
 
@@ -49,6 +72,9 @@ export interface BuildJsonOptions {
   trimmed: boolean;
   settings: Settings;
   atlasDataURL?: string;
+  projectName?: string;
+  clips?: AtlasJSONClip[];
+  mergeHistory?: ExportedMergeRecord[];
 }
 
 /** 由打包结果生成 JSON 对象（纯函数） */
@@ -87,6 +113,9 @@ export function buildAtlasJSON(layout: PackLayout, opts: BuildJsonOptions): Atla
     totalDuration: total
   };
   if (opts.atlasDataURL) meta.atlasDataURL = opts.atlasDataURL;
+  if (opts.projectName) meta.projectName = opts.projectName;
+  if (opts.clips && opts.clips.length > 0) meta.clips = opts.clips;
+  if (opts.mergeHistory && opts.mergeHistory.length > 0) meta.mergeHistory = opts.mergeHistory;
 
   return { frames, meta };
 }
@@ -107,6 +136,11 @@ export interface ParsedAtlasJSON {
   settings: Settings;
   imageName: string;
   atlasDataURL?: string;
+  projectName?: string;
+  /** 动画片段（按帧名顺序引用）；旧格式无此字段时为空数组 */
+  clips: AtlasJSONClip[];
+  /** 合并历史；旧格式无此字段时为空数组 */
+  mergeHistory: ExportedMergeRecord[];
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -187,6 +221,54 @@ export function parseAtlasJSON(raw: unknown): ParsedAtlasJSON {
 
   const imageName = typeof meta.image === "string" ? meta.image : "atlas.png";
   const atlasDataURL = typeof meta.atlasDataURL === "string" ? meta.atlasDataURL : undefined;
+  const projectName = typeof meta.projectName === "string" ? meta.projectName : undefined;
 
-  return { frames, size, settings, imageName, ...(atlasDataURL ? { atlasDataURL } : {}) };
+  // 片段与合并历史为可选扩展字段，做宽松校验（不合法则忽略，保证旧格式兼容）
+  const clips: AtlasJSONClip[] = [];
+  if (Array.isArray(meta.clips)) {
+    for (const c of meta.clips) {
+      if (isRecord(c) && typeof c.name === "string" && Array.isArray(c.frames)) {
+        clips.push({ name: c.name, frames: c.frames.filter((n): n is string => typeof n === "string") });
+      }
+    }
+  }
+  const mergeHistory: ExportedMergeRecord[] = [];
+  if (Array.isArray(meta.mergeHistory)) {
+    const safeNum = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+    for (const m of meta.mergeHistory) {
+      if (isRecord(m) && typeof m.id === "string" && isRecord(m.source) && isRecord(m.summary)) {
+        mergeHistory.push({
+          id: m.id,
+          ts: typeof m.ts === "number" ? m.ts : 0,
+          undone: m.undone === true,
+          source: {
+            name: typeof m.source.name === "string" ? m.source.name : "未知工程",
+            origin: typeof m.source.origin === "string" ? m.source.origin : "import",
+            frameCount: safeNum(m.source.frameCount),
+            clipCount: safeNum(m.source.clipCount)
+          },
+          decisions: isRecord(m.decisions) ? (m.decisions as Record<string, string>) : {},
+          renames: isRecord(m.renames) ? (m.renames as Record<string, string>) : {},
+          summary: {
+            identical: safeNum(m.summary.identical),
+            conflicts: safeNum(m.summary.conflicts),
+            added: safeNum(m.summary.added),
+            clipsAdded: safeNum(m.summary.clipsAdded),
+            clipsRenamed: safeNum(m.summary.clipsRenamed)
+          }
+        });
+      }
+    }
+  }
+
+  return {
+    frames,
+    size,
+    settings,
+    imageName,
+    ...(atlasDataURL ? { atlasDataURL } : {}),
+    ...(projectName ? { projectName } : {}),
+    clips,
+    mergeHistory
+  };
 }

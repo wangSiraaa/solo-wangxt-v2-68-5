@@ -2,8 +2,8 @@
   import { onDestroy, onMount } from "svelte";
   import { Application, Graphics, Rectangle, Sprite, Texture } from "pixi.js";
   import { Animator } from "../core/animator";
-  import { frames, packResult, selectedId } from "../core/store";
-  import type { PackedFrame } from "../core/types";
+  import { clips, frames, packResult, selectedClipId, selectedId } from "../core/store";
+  import type { FrameItem, PackedFrame } from "../core/types";
 
   let wrap: HTMLDivElement;
   let app: Application | null = null;
@@ -20,14 +20,23 @@
   let curAtlasInfo = "";
   let curOffsetInfo = "";
 
-  let textures: Texture[] = [];
-  let offsets: Array<{ x: number; y: number }> = [];
-  let packedFrames: PackedFrame[] | null = null;
+  // 以帧 id 索引的纹理与偏移（切换片段无需重建纹理）
+  let texById = new Map<string, Texture>();
+  let offById = new Map<string, { x: number; y: number }>();
+  let packedById = new Map<string, PackedFrame>();
   let baseTexture: Texture | null = null;
   let rebuildToken = 0;
   let baseX = 0;
   let baseY = 0;
   let stageScale = 1;
+
+  // 播放序列：选中片段时按片段的顺序引用播放，否则播放全部帧
+  $: activeClip = $clips.find((c) => c.id === $selectedClipId) ?? null;
+  $: playList = activeClip
+    ? activeClip.frameIds
+        .map((id) => $frames.find((f) => f.id === id))
+        .filter((f): f is FrameItem => !!f)
+    : $frames;
 
   function loadImage(url: string): Promise<HTMLImageElement> {
     return new Promise((resolve, reject) => {
@@ -39,8 +48,10 @@
   }
 
   function disposeTextures(): void {
-    for (const t of textures) t.destroy(false);
-    textures = [];
+    for (const t of texById.values()) t.destroy(false);
+    texById = new Map();
+    offById = new Map();
+    packedById = new Map();
     if (baseTexture) {
       baseTexture.destroy(true);
       baseTexture = null;
@@ -54,8 +65,6 @@
     const pack = $packResult;
 
     disposeTextures();
-    offsets = [];
-    packedFrames = pack ? pack.frames : null;
     animator.reset();
 
     if (list.length === 0) {
@@ -72,22 +81,33 @@
       const img = await loadImage(pack.atlasUrl);
       if (token !== rebuildToken) return;
       baseTexture = Texture.from(img);
-      textures = pack.frames.map(
-        (f) => new Texture({ source: baseTexture!.source, frame: new Rectangle(f.x, f.y, f.w, f.h) })
-      );
-      offsets = pack.frames.map((f) => ({ x: f.trim.x, y: f.trim.y }));
+      for (const f of pack.frames) {
+        texById.set(f.id, new Texture({ source: baseTexture.source, frame: new Rectangle(f.x, f.y, f.w, f.h) }));
+        offById.set(f.id, { x: f.trim.x, y: f.trim.y });
+        packedById.set(f.id, f);
+      }
     } else {
       const imgs = await Promise.all(list.map((f) => loadImage(f.url)));
       if (token !== rebuildToken) return;
-      textures = imgs.map((img) => Texture.from(img));
-      offsets = list.map(() => ({ x: 0, y: 0 }));
+      for (const [i, f] of list.entries()) {
+        texById.set(f.id, Texture.from(imgs[i]!));
+        offById.set(f.id, { x: 0, y: 0 });
+      }
     }
 
     layoutStage();
+    applySequence();
     if (sprite) {
-      sprite.visible = true;
+      sprite.visible = playList.length > 0;
       applyFrame(0);
     }
+  }
+
+  /** 播放序列变化（选中片段 / 片段内容 / 帧集合）时重置动画器 */
+  function applySequence(): void {
+    animator.setDurations(playList.map((f) => f.duration));
+    animator.reset();
+    if (sprite) sprite.visible = playList.length > 0;
   }
 
   function layoutStage(): void {
@@ -111,22 +131,21 @@
   }
 
   function applyFrame(i: number): void {
-    if (!sprite || i < 0 || i >= textures.length) return;
-    const tex = textures[i];
-    const off = offsets[i];
+    if (!sprite || i < 0 || i >= playList.length) return;
+    const item = playList[i]!;
+    const tex = texById.get(item.id);
+    const off = offById.get(item.id);
     if (!tex || !off) return;
     sprite.texture = tex;
     sprite.position.set(baseX + off.x * stageScale, baseY + off.y * stageScale);
 
     curIndex = i;
-    const list = $frames;
-    const item = list[i];
-    curName = item?.name ?? "";
-    curDuration = item?.duration ?? 0;
-    const pf = packedFrames?.[i];
+    curName = item.name;
+    curDuration = item.duration;
+    const pf = packedById.get(item.id);
     curAtlasInfo = pf ? `图集 (${pf.x}, ${pf.y}) ${pf.w}×${pf.h}` : "未打包";
     curOffsetInfo = pf ? `偏移 (${pf.trim.x}, ${pf.trim.y}) 原始 ${pf.srcW}×${pf.srcH}` : "";
-    selectedId.set(item?.id ?? null);
+    selectedId.set(item.id);
   }
 
   onMount(async () => {
@@ -160,7 +179,7 @@
     app = null;
   });
 
-  // 帧集合或打包结果变化 → 重建纹理；时长变化 → 只更新动画器
+  // 帧集合或打包结果变化 → 重建纹理；播放序列变化 → 只重置动画器
   $: frameKey = $frames.map((f) => f.id).join(",");
   $: packKey = $packResult ? $packResult.atlasUrl : "";
   $: if (app) {
@@ -168,8 +187,10 @@
     void packKey;
     void rebuild();
   }
+  $: seqKey = playList.map((f) => f.id).join(",") + "|" + playList.map((f) => f.duration).join(",");
   $: if (app) {
-    animator.setDurations($frames.map((f) => f.duration));
+    void seqKey;
+    applySequence();
   }
 
   function togglePlay(): void {
@@ -178,13 +199,15 @@
 </script>
 
 <div class="panel">
-  <h2>动画预览（PixiJS · 按原顺序与帧时长播放）</h2>
+  <h2>
+    动画预览（PixiJS · {activeClip ? `片段「${activeClip.name}」` : "按原顺序与帧时长播放"}）
+  </h2>
   <div class="stage checker" bind:this={wrap} data-testid="preview-stage"></div>
   <div class="controls">
     <button id="play-btn" on:click={togglePlay}>{playing ? "⏸ 暂停" : "▶ 播放"}</button>
     <span class="mono info" id="preview-frame-label">
-      {#if curIndex >= 0}
-        帧 {curIndex + 1}/{$frames.length} · {curName} · {curDuration}ms
+      {#if curIndex >= 0 && playList.length > 0}
+        帧 {curIndex + 1}/{playList.length} · {curName} · {curDuration}ms
       {:else}
         无帧
       {/if}

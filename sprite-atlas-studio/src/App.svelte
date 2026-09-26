@@ -1,17 +1,22 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import Toolbar from "./lib/components/Toolbar.svelte";
+  import ProjectBar from "./lib/components/ProjectBar.svelte";
   import SettingsPanel from "./lib/components/SettingsPanel.svelte";
   import FrameList from "./lib/components/FrameList.svelte";
+  import ClipsPanel from "./lib/components/ClipsPanel.svelte";
   import Preview from "./lib/components/Preview.svelte";
   import AtlasView from "./lib/components/AtlasView.svelte";
-  import { addFiles, restoreFromDB, startAutoSave, status, notify } from "./lib/core/store";
+  import MergeDialog from "./lib/components/MergeDialog.svelte";
+  import MergeHistory from "./lib/components/MergeHistory.svelte";
+  import { addFiles, boot, startAutoSave, status, notify } from "./lib/core/store";
 
   let ready = false;
   let dragOver = false;
+  let mergeOpen = false;
 
   onMount(async () => {
-    const restored = await restoreFromDB();
+    const restored = await boot();
     if (restored) notify("已从浏览器本地恢复上次项目");
     startAutoSave();
     ready = true;
@@ -32,6 +37,7 @@
   <span class="sub">序列帧 → 精灵图集 · 纯本地运行，图片不离开浏览器</span>
 </header>
 
+<ProjectBar onOpenMerge={() => (mergeOpen = true)} />
 <Toolbar />
 
 {#if $status}
@@ -50,11 +56,17 @@
     </section>
     <section class="center">
       <Preview />
+      <ClipsPanel />
     </section>
     <section class="right">
       <AtlasView />
+      <MergeHistory />
     </section>
   </main>
+{/if}
+
+{#if mergeOpen}
+  <MergeDialog onClose={() => (mergeOpen = false)} />
 {/if}
 
 <style>
